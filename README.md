@@ -1,5 +1,8 @@
 # Product Feed Batch Processor
 
+[![Node.js CI](https://github.com/jschatz1/p-interview/actions/workflows/node.js.yml/badge.svg)](https://github.com/jschatz1/p-interview/actions/workflows/node.js.yml)
+[![codecov](https://codecov.io/gh/jschatz1/p-interview/branch/main/graph/badge.svg)](https://codecov.io/gh/jschatz1/p-interview)
+
 A Node.js application that parses large XML product feeds, extracts product information, and sends batched data to an external service.
 
 ## Features
