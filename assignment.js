@@ -132,10 +132,8 @@ class ProductFeedProcessor {
 
     try {
       await this.sendBatchWithRetry(batchJson, this.batchesSent);
-    } catch (error) {
-      // Log but don't throw - let caller decide whether to continue
-      throw error;
     } finally {
+      // Always reset batch, even if send fails
       this.currentBatch = [];
       this.currentBatchSize = 0;
     }

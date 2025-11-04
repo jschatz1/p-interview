@@ -6,7 +6,7 @@ module.exports = {
   },
   extends: 'eslint:recommended',
   parserOptions: {
-    ecmaVersion: 12,
+    ecmaVersion: 2022, // Support class fields and other modern features
     sourceType: 'module'
   },
   rules: {
