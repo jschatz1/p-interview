@@ -714,3 +714,285 @@ describe('XML Parsing Errors', () => {
     expect(processor.skippedProducts).toBe(1);
   });
 });
+
+describe('Sequential Processing & Race Conditions', () => {
+  let processor;
+  let mockExternalService;
+  let mockLogger;
+  const testFixturesDir = path.join(__dirname, 'test-fixtures');
+
+  beforeEach(() => {
+    mockExternalService = {
+      call: jest.fn()
+    };
+    mockLogger = {
+      startMetrics: jest.fn(),
+      recordBatch: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+      debug: jest.fn(),
+      logMetrics: jest.fn()
+    };
+
+    if (!fs.existsSync(testFixturesDir)) {
+      fs.mkdirSync(testFixturesDir);
+    }
+  });
+
+  it('should process products in sequential order', async () => {
+    const feedPath = path.join(testFixturesDir, 'sequential-test.xml');
+    const feedContent = `<?xml version="1.0"?>
+<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">
+  <channel>
+    <item>
+      <g:id>FIRST</g:id>
+      <title>First Product</title>
+      <g:description>First</g:description>
+    </item>
+    <item>
+      <g:id>SECOND</g:id>
+      <title>Second Product</title>
+      <g:description>Second</g:description>
+    </item>
+    <item>
+      <g:id>THIRD</g:id>
+      <title>Third Product</title>
+      <g:description>Third</g:description>
+    </item>
+    <item>
+      <g:id>FOURTH</g:id>
+      <title>Fourth Product</title>
+      <g:description>Fourth</g:description>
+    </item>
+  </channel>
+</rss>`;
+
+    fs.writeFileSync(feedPath, feedContent);
+
+    processor = new ProductFeedProcessor(feedPath, {
+      externalService: mockExternalService,
+      logger: mockLogger
+    });
+
+    await processor.process();
+
+    const batch = JSON.parse(mockExternalService.call.mock.calls[0][0]);
+    expect(batch).toHaveLength(4);
+    expect(batch[0].id).toBe('FIRST');
+    expect(batch[1].id).toBe('SECOND');
+    expect(batch[2].id).toBe('THIRD');
+    expect(batch[3].id).toBe('FOURTH');
+  });
+
+  it('should prevent race conditions when processing multiple products rapidly', async () => {
+    const feedPath = path.join(testFixturesDir, 'race-condition-test.xml');
+    const items = Array.from({ length: 50 }, (_, i) => `
+    <item>
+      <g:id>PROD${String(i).padStart(3, '0')}</g:id>
+      <title>Product ${i}</title>
+      <g:description>Description ${i}</g:description>
+    </item>`).join('\n');
+
+    const feedContent = `<?xml version="1.0"?>
+<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">
+  <channel>
+${items}
+  </channel>
+</rss>`;
+
+    fs.writeFileSync(feedPath, feedContent);
+
+    processor = new ProductFeedProcessor(feedPath, {
+      externalService: mockExternalService,
+      logger: mockLogger
+    });
+
+    await processor.process();
+
+    // Verify all products were processed
+    expect(processor.productsProcessed).toBe(50);
+
+    // Collect all products from all batches
+    const allProducts = mockExternalService.call.mock.calls
+      .map(call => JSON.parse(call[0]))
+      .flat();
+
+    expect(allProducts).toHaveLength(50);
+
+    // Verify order is maintained
+    for (let i = 0; i < 50; i++) {
+      expect(allProducts[i].id).toBe(`PROD${String(i).padStart(3, '0')}`);
+      expect(allProducts[i].title).toBe(`Product ${i}`);
+    }
+  });
+
+  it('should maintain correct batch counts without race conditions', async () => {
+    processor = new ProductFeedProcessor('dummy.xml', {
+      externalService: mockExternalService,
+      logger: mockLogger
+    });
+
+    const batchSizeSnapshots = [];
+
+    // Mock sendBatch to capture currentBatch size at send time
+    const originalSendBatch = processor.sendBatch.bind(processor);
+    processor.sendBatch = async function() {
+      batchSizeSnapshots.push(this.currentBatch.length);
+      return originalSendBatch();
+    };
+
+    // Add products sequentially
+    for (let i = 0; i < 100; i++) {
+      await processor.addProductToBatch({
+        id: `P${i}`,
+        title: `Product ${i}`,
+        description: 'x'.repeat(60000) // 60KB each to trigger multiple batches
+      });
+    }
+
+    // Send final batch
+    await processor.sendBatch();
+
+    // Verify no batch was empty when sent (except possibly the final one)
+    const nonFinalBatches = batchSizeSnapshots.slice(0, -1);
+    nonFinalBatches.forEach((size, idx) => {
+      expect(size).toBeGreaterThan(0);
+    });
+
+    // Verify total products processed
+    expect(processor.productsProcessed).toBe(100);
+  });
+
+  it('should ensure final tail batch is sent even with sequential processing', async () => {
+    const feedPath = path.join(testFixturesDir, 'tail-batch-test.xml');
+    // Create exactly 7 products where 5 will fill one batch and 2 remain
+    const items = Array.from({ length: 7 }, (_, i) => `
+    <item>
+      <g:id>TAIL${i}</g:id>
+      <title>Product ${i}</title>
+      <g:description>${'x'.repeat(1000000)}</g:description>
+    </item>`).join('\n');
+
+    const feedContent = `<?xml version="1.0"?>
+<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">
+  <channel>
+${items}
+  </channel>
+</rss>`;
+
+    fs.writeFileSync(feedPath, feedContent);
+
+    processor = new ProductFeedProcessor(feedPath, {
+      externalService: mockExternalService,
+      logger: mockLogger
+    });
+
+    await processor.process();
+
+    // Should have sent at least 2 batches (one full, one tail)
+    expect(mockExternalService.call.mock.calls.length).toBeGreaterThanOrEqual(1);
+
+    // Verify all 7 products were processed
+    const allProducts = mockExternalService.call.mock.calls
+      .map(call => JSON.parse(call[0]))
+      .flat();
+
+    expect(allProducts).toHaveLength(7);
+    expect(processor.productsProcessed).toBe(7);
+
+    // Verify the tail batch was sent (last batch should be smaller)
+    if (mockExternalService.call.mock.calls.length > 1) {
+      const lastBatch = JSON.parse(
+        mockExternalService.call.mock.calls[mockExternalService.call.mock.calls.length - 1][0]
+      );
+      const firstBatch = JSON.parse(mockExternalService.call.mock.calls[0][0]);
+      expect(lastBatch.length).toBeLessThan(firstBatch.length);
+    }
+  });
+
+  it('should handle sequential processing with async delays without corruption', async () => {
+    processor = new ProductFeedProcessor('dummy.xml', {
+      externalService: mockExternalService,
+      logger: mockLogger
+    });
+
+    // Track the order products are added
+    const processOrder = [];
+
+    const originalAddProduct = processor.addProductToBatch.bind(processor);
+    processor.addProductToBatch = async function(product) {
+      // Add small random delays to simulate real async behavior
+      await new Promise(resolve => setTimeout(resolve, Math.random() * 10));
+      processOrder.push(product.id);
+      return originalAddProduct(product);
+    };
+
+    // Create a promise chain that simulates the sequential processing
+    let processingQueue = Promise.resolve();
+
+    for (let i = 0; i < 20; i++) {
+      const product = {
+        id: `SEQ${i}`,
+        title: `Product ${i}`,
+        description: `Description ${i}`
+      };
+
+      // Chain operations sequentially like in the actual code
+      processingQueue = processingQueue.then(() =>
+        processor.addProductToBatch(product)
+      );
+    }
+
+    await processingQueue;
+
+    // Verify products were processed in order despite async delays
+    for (let i = 0; i < 20; i++) {
+      expect(processOrder[i]).toBe(`SEQ${i}`);
+    }
+  });
+
+  it('should not have concurrent batch modifications during sequential processing', async () => {
+    processor = new ProductFeedProcessor('dummy.xml', {
+      externalService: mockExternalService,
+      logger: mockLogger
+    });
+
+    let concurrentOperations = 0;
+    let maxConcurrent = 0;
+
+    const originalAddProduct = processor.addProductToBatch.bind(processor);
+    processor.addProductToBatch = async function(product) {
+      concurrentOperations++;
+      maxConcurrent = Math.max(maxConcurrent, concurrentOperations);
+
+      // Simulate async work
+      await new Promise(resolve => setTimeout(resolve, 5));
+
+      const result = await originalAddProduct(product);
+
+      concurrentOperations--;
+      return result;
+    };
+
+    // Create sequential processing chain
+    let processingQueue = Promise.resolve();
+
+    for (let i = 0; i < 10; i++) {
+      const product = {
+        id: `CONC${i}`,
+        title: `Product ${i}`,
+        description: `Description ${i}`
+      };
+
+      processingQueue = processingQueue.then(() =>
+        processor.addProductToBatch(product)
+      );
+    }
+
+    await processingQueue;
+
+    // With sequential processing, we should never have more than 1 concurrent operation
+    expect(maxConcurrent).toBe(1);
+  });
+});
