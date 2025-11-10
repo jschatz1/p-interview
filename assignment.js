@@ -22,7 +22,7 @@ class ProductFeedProcessor {
 
     // Progress tracking
     this.lastProgressUpdate = Date.now();
-    this.progressInterval = 5000; // Update every 5 seconds
+    this.progressInterval = 1000; // Update every 5 seconds
 
     // Rate limiting
     this.lastBatchSentTime = 0;
@@ -126,13 +126,13 @@ class ProductFeedProcessor {
 
   async sendBatch() {
     if (this.currentBatch.length === 0) return;
-
     this.batchesSent++;
+    console.log("Batches Sent: ", this.batchesSent);
     const batchJson = JSON.stringify(this.currentBatch);
-
     try {
       await this.sendBatchWithRetry(batchJson, this.batchesSent);
     } finally {
+      this.logger.info("Clean up is happening")
       // Always reset batch, even if send fails
       this.currentBatch = [];
       this.currentBatchSize = 0;
@@ -186,7 +186,7 @@ class ProductFeedProcessor {
     return new Promise((resolve, reject) => {
       const stream = fs.createReadStream(this.xmlFilePath);
       const xml = new XmlStream(stream);
-      const pendingOperations = [];
+      let processingQueue = Promise.resolve();
 
       // Preserve child nodes as we need to extract nested elements
       xml.preserve('item', true);
@@ -201,14 +201,15 @@ class ProductFeedProcessor {
 
         const product = this.extractProductData(item);
         if (product.id && product.title) {
-          // Track async operation
-          const operation = this.addProductToBatch(product).catch(error => {
-            this.logger.error('Error adding product to batch', {
-              productId: product.id,
-              error: error.message
-            });
-          });
-          pendingOperations.push(operation);
+          // Chain operations sequentially to avoid race conditions
+          processingQueue = processingQueue.then(() =>
+            this.addProductToBatch(product).catch(error => {
+              this.logger.error('Error adding product to batch', {
+                productId: product.id,
+                error: error.message
+              });
+            })
+          );
         } else {
           this.skippedProducts++;
           this.logger.debug('Skipping product without id or title', {
@@ -226,13 +227,15 @@ class ProductFeedProcessor {
 
         const product = this.extractProductData(entry);
         if (product.id && product.title) {
-          const operation = this.addProductToBatch(product).catch(error => {
-            this.logger.error('Error adding product to batch', {
-              productId: product.id,
-              error: error.message
-            });
-          });
-          pendingOperations.push(operation);
+          // Chain operations sequentially to avoid race conditions
+          processingQueue = processingQueue.then(() =>
+            this.addProductToBatch(product).catch(error => {
+              this.logger.error('Error adding product to batch', {
+                productId: product.id,
+                error: error.message
+              });
+            })
+          );
         } else {
           this.skippedProducts++;
         }
@@ -240,8 +243,8 @@ class ProductFeedProcessor {
 
       xml.on('end', async () => {
         try {
-          // Wait for all pending operations to complete
-          await Promise.all(pendingOperations);
+          // Wait for all queued operations to complete sequentially
+          await processingQueue;
 
           // Send any remaining products in the final batch
           await this.sendBatch();
